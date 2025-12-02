@@ -1,19 +1,500 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
+# Azure Front Door Premium Deployment Pipeline
+# Deploys Front Door Premium infrastructure across DEV, QA, UAT, and PROD environments
 
-trigger:
-- main
+variables:
+  - group: DevOps-KeyVault
+  - name: 'AgentPool'
+    value: 'hwcex-windows'
 
-pool:
-  vmImage: ubuntu-latest
+trigger: none
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+stages:
+  ###### BUILD #######
+  - stage: Build
+    displayName: Build stage
+    jobs:
+      - job: Build
+        displayName: Build Terraform Artifacts
+        pool:
+          name: $(AgentPool)
+        steps:
+          - task: CopyFiles@2
+            displayName: 'Copy Terraform files to artifacts: DEV'
+            inputs:
+              SourceFolder: deployments/dev
+              Contents: |
+                *.tf
+                *.tfvars
+                !(*.md)
+              TargetFolder: '$(Build.ArtifactStagingDirectory)/DEV'
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Artifact: terraform'
+            inputs:
+              ArtifactName: terraform
+
+  ###### DEPLOY - DEV #######
+  - stage: DEV
+    displayName: n21-pex-dev-projectex-frontdoor
+    dependsOn: Build
+    condition: succeeded()
+    pool:
+      name: $(AgentPool)
+    variables:
+      - group: n21-pex-nonprod-kv
+    jobs:
+      - deployment: terraform_plan
+        displayName: 'Terraform Plan: DEV'
+        environment: dev
+        variables:
+          tf_environment: DEV
+          tf_resource_group_name: TROP-DEVOPS-TERRAFORM-NONPROD
+          tf_storage_account_name: tfwtwhcbtrodevpex
+          tf_container_name: tf148612
+          tf_version: '1.5.0'
+          TF_VAR_dns_zone_id: $(kv-dns-zone-id-dev)
+          TF_VAR_cdn_contributor_spn: $(kv-cdn-contributor-spn-dev)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - template: terraform.artifacts.yml
+                - template: terraform.plan.yml
+                  parameters:
+                    ServiceConnection: DEVOPS-AZDO-Pipeline-Subscription-Contributor-DEV
+                    ARM_SUBSCRIPTION_ID: $(kv-arm-subscription-id-dev)
+                    ARM_CLIENT_ID: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-DEV-clientid)
+                    ARM_CLIENT_SECRET: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-DEV)
+                    ARM_TENANT_ID: $(kv-arm-tenant-id)
+      - job: validation_step
+        displayName: Terraform plan validation
+        dependsOn: terraform_plan
+        pool: server
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 20 # task times out in 20 mins
+            inputs:
+              instructions: 'Please validate the Terraform Plan output'
+              onTimeout: 'reject'
+      - deployment: terrform_apply
+        displayName: 'Terraform Apply: DEV'
+        dependsOn: validation_step
+        environment: dev
+        variables:
+          tf_environment: DEV
+          tf_resource_group_name: TROP-DEVOPS-TERRAFORM-NONPROD
+          tf_storage_account_name: tfwtwhcbtrodevpex
+          tf_container_name: tf148612
+          tf_version: '1.5.0'
+        pool:
+          name: $(AgentPool)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - template: terraform.artifacts.yml
+                  parameters:
+                    ScriptsOnly: true
+                - template: terraform.apply.yml
+                  parameters:
+                    ServiceConnection: DEVOPS-AZDO-Pipeline-Subscription-Contributor-DEV
+                    ARM_SUBSCRIPTION_ID: $(kv-arm-subscription-id-dev)
+                    ARM_CLIENT_ID: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-DEV-clientid)
+                    ARM_CLIENT_SECRET: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-DEV)
+                    ARM_TENANT_ID: $(kv-arm-tenant-id)
+
+  ###### DEPLOY - QA #######
+  - stage: QA
+    displayName: Deploy Front Door - QA
+    dependsOn: DEV
+    condition: succeeded()
+    pool:
+      name: $(AgentPool)
+    variables:
+      - group: n21-pex-nonprod-kv
+    jobs:
+      - deployment: terraform_plan_qa
+        displayName: 'Terraform Plan: Front Door QA'
+        environment: qa
+        variables:
+          tf_environment: qa
+          tf_working_dir: '$(Pipeline.Workspace)/frontdoor-terraform/deployments/qa'
+          tf_backend_resource_group: TROP-DEVOPS-TERRAFORM-NONPROD
+          tf_backend_storage_account: tfwtwhcbtrodevpex
+          tf_backend_container: frontdoor-qa
+          tf_backend_key: frontdoor-qa.tfstate
+          ARM_SUBSCRIPTION_ID: $(kv-arm-subscription-id-dev)
+          ARM_CLIENT_ID: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-DEV-clientid)
+          ARM_CLIENT_SECRET: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-DEV)
+          ARM_TENANT_ID: $(kv-arm-tenant-id)
+          TF_VAR_dns_zone_id: $(kv-dns-zone-id-qa)
+          TF_VAR_cdn_contributor_spn: $(kv-cdn-contributor-spn-qa)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: frontdoor-terraform
+                  displayName: 'Download Terraform Artifacts'
+
+                - task: TerraformInstaller@0
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(TerraformVersion)
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Init'
+                  inputs:
+                    azureSubscription: 'DEVOPS-AZDO-Pipeline-Subscription-Contributor-DEV'
+                    scriptType: 'pscore'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(tf_working_dir)
+                      terraform init `
+                        -backend-config="resource_group_name=$(tf_backend_resource_group)" `
+                        -backend-config="storage_account_name=$(tf_backend_storage_account)" `
+                        -backend-config="container_name=$(tf_backend_container)" `
+                        -backend-config="key=$(tf_backend_key)"
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Plan'
+                  inputs:
+                    azureSubscription: 'DEVOPS-AZDO-Pipeline-Subscription-Contributor-DEV'
+                    scriptType: 'pscore'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(tf_working_dir)
+                      terraform plan -out=tfplan -input=false
+                    addSpnToEnvironment: true
+
+      - job: validation_step_qa
+        displayName: Terraform Plan Validation - QA
+        dependsOn: terraform_plan_qa
+        pool: server
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 60
+            inputs:
+              instructions: 'Please review the Terraform Plan output for QA Front Door deployment and approve to proceed with apply'
+              onTimeout: 'reject'
+
+      - deployment: terraform_apply_qa
+        displayName: 'Terraform Apply: Front Door QA'
+        dependsOn: validation_step_qa
+        environment: qa
+        variables:
+          tf_environment: qa
+          tf_working_dir: '$(Pipeline.Workspace)/frontdoor-terraform/deployments/qa'
+          tf_backend_resource_group: TROP-DEVOPS-TERRAFORM-NONPROD
+          tf_backend_storage_account: tfwtwhcbtrodevpex
+          tf_backend_container: frontdoor-qa
+          tf_backend_key: frontdoor-qa.tfstate
+          ARM_SUBSCRIPTION_ID: $(kv-arm-subscription-id-dev)
+          ARM_CLIENT_ID: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-DEV-clientid)
+          ARM_CLIENT_SECRET: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-DEV)
+          ARM_TENANT_ID: $(kv-arm-tenant-id)
+          TF_VAR_dns_zone_id: $(kv-dns-zone-id-qa)
+          TF_VAR_cdn_contributor_spn: $(kv-cdn-contributor-spn-qa)
+        pool:
+          name: $(AgentPool)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: frontdoor-terraform
+                  displayName: 'Download Terraform Artifacts'
+
+                - task: TerraformInstaller@0
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(TerraformVersion)
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Init'
+                  inputs:
+                    azureSubscription: 'DEVOPS-AZDO-Pipeline-Subscription-Contributor-DEV'
+                    scriptType: 'pscore'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(tf_working_dir)
+                      terraform init `
+                        -backend-config="resource_group_name=$(tf_backend_resource_group)" `
+                        -backend-config="storage_account_name=$(tf_backend_storage_account)" `
+                        -backend-config="container_name=$(tf_backend_container)" `
+                        -backend-config="key=$(tf_backend_key)"
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Apply'
+                  inputs:
+                    azureSubscription: 'DEVOPS-AZDO-Pipeline-Subscription-Contributor-DEV'
+                    scriptType: 'pscore'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(tf_working_dir)
+                      terraform apply -auto-approve -input=false
+                    addSpnToEnvironment: true
+
+  ###### DEPLOY - UAT #######
+  - stage: UAT
+    displayName: Deploy Front Door - UAT
+    dependsOn: QA
+    condition: succeeded()
+    pool:
+      name: $(AgentPool)
+    variables:
+      - group: n20-pex-prod-kv
+    jobs:
+      - deployment: terraform_plan_uat
+        displayName: 'Terraform Plan: Front Door UAT'
+        environment: uat
+        variables:
+          tf_environment: uat
+          tf_working_dir: '$(Pipeline.Workspace)/frontdoor-terraform/deployments/uat'
+          tf_backend_resource_group: TROP-DEVOPS-TERRAFORM-PROD
+          tf_backend_storage_account: tfwtwhcbtroprodpex
+          tf_backend_container: frontdoor-uat
+          tf_backend_key: frontdoor-uat.tfstate
+          ARM_SUBSCRIPTION_ID: $(kv-arm-subscription-id-prod)
+          ARM_CLIENT_ID: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD-clientid)
+          ARM_CLIENT_SECRET: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD)
+          ARM_TENANT_ID: $(kv-arm-tenant-id)
+          TF_VAR_dns_zone_id: $(kv-dns-zone-id-uat)
+          TF_VAR_cdn_contributor_spn: $(kv-cdn-contributor-spn-uat)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: frontdoor-terraform
+                  displayName: 'Download Terraform Artifacts'
+
+                - task: TerraformInstaller@0
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(TerraformVersion)
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Init'
+                  inputs:
+                    azureSubscription: 'DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD'
+                    scriptType: 'pscore'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(tf_working_dir)
+                      terraform init `
+                        -backend-config="resource_group_name=$(tf_backend_resource_group)" `
+                        -backend-config="storage_account_name=$(tf_backend_storage_account)" `
+                        -backend-config="container_name=$(tf_backend_container)" `
+                        -backend-config="key=$(tf_backend_key)"
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Plan'
+                  inputs:
+                    azureSubscription: 'DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD'
+                    scriptType: 'pscore'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(tf_working_dir)
+                      terraform plan -out=tfplan -input=false
+                    addSpnToEnvironment: true
+
+      - job: validation_step_uat
+        displayName: Terraform Plan Validation - UAT
+        dependsOn: terraform_plan_uat
+        pool: server
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 60
+            inputs:
+              instructions: 'Please review the Terraform Plan output for UAT Front Door deployment and approve to proceed with apply'
+              onTimeout: 'reject'
+
+      - deployment: terraform_apply_uat
+        displayName: 'Terraform Apply: Front Door UAT'
+        dependsOn: validation_step_uat
+        environment: uat
+        variables:
+          tf_environment: uat
+          tf_working_dir: '$(Pipeline.Workspace)/frontdoor-terraform/deployments/uat'
+          tf_backend_resource_group: TROP-DEVOPS-TERRAFORM-PROD
+          tf_backend_storage_account: tfwtwhcbtroprodpex
+          tf_backend_container: frontdoor-uat
+          tf_backend_key: frontdoor-uat.tfstate
+          ARM_SUBSCRIPTION_ID: $(kv-arm-subscription-id-prod)
+          ARM_CLIENT_ID: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD-clientid)
+          ARM_CLIENT_SECRET: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD)
+          ARM_TENANT_ID: $(kv-arm-tenant-id)
+          TF_VAR_dns_zone_id: $(kv-dns-zone-id-uat)
+          TF_VAR_cdn_contributor_spn: $(kv-cdn-contributor-spn-uat)
+        pool:
+          name: $(AgentPool)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: frontdoor-terraform
+                  displayName: 'Download Terraform Artifacts'
+
+                - task: TerraformInstaller@0
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(TerraformVersion)
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Init'
+                  inputs:
+                    azureSubscription: 'DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD'
+                    scriptType: 'pscore'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(tf_working_dir)
+                      terraform init `
+                        -backend-config="resource_group_name=$(tf_backend_resource_group)" `
+                        -backend-config="storage_account_name=$(tf_backend_storage_account)" `
+                        -backend-config="container_name=$(tf_backend_container)" `
+                        -backend-config="key=$(tf_backend_key)"
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Apply'
+                  inputs:
+                    azureSubscription: 'DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD'
+                    scriptType: 'pscore'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(tf_working_dir)
+                      terraform apply -auto-approve -input=false
+                    addSpnToEnvironment: true
+
+  ###### DEPLOY - PROD #######
+  - stage: PROD
+    displayName: Deploy Front Door - PROD
+    dependsOn: UAT
+    condition: succeeded()
+    pool:
+      name: $(AgentPool)
+    variables:
+      - group: n20-pex-prod-kv
+    jobs:
+      - deployment: terraform_plan_prod
+        displayName: 'Terraform Plan: Front Door PROD'
+        environment: prod
+        variables:
+          tf_environment: prod
+          tf_working_dir: '$(Pipeline.Workspace)/frontdoor-terraform/deployments/prod'
+          tf_backend_resource_group: TROP-DEVOPS-TERRAFORM-PROD
+          tf_backend_storage_account: tfwtwhcbtroprodpex
+          tf_backend_container: frontdoor-prod
+          tf_backend_key: frontdoor-prod.tfstate
+          ARM_SUBSCRIPTION_ID: $(kv-arm-subscription-id-prod)
+          ARM_CLIENT_ID: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD-clientid)
+          ARM_CLIENT_SECRET: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD)
+          ARM_TENANT_ID: $(kv-arm-tenant-id)
+          TF_VAR_dns_zone_id: $(kv-dns-zone-id-prod)
+          TF_VAR_cdn_contributor_spn: $(kv-cdn-contributor-spn-prod)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: frontdoor-terraform
+                  displayName: 'Download Terraform Artifacts'
+
+                - task: TerraformInstaller@0
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(TerraformVersion)
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Init'
+                  inputs:
+                    azureSubscription: 'DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD'
+                    scriptType: 'pscore'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(tf_working_dir)
+                      terraform init `
+                        -backend-config="resource_group_name=$(tf_backend_resource_group)" `
+                        -backend-config="storage_account_name=$(tf_backend_storage_account)" `
+                        -backend-config="container_name=$(tf_backend_container)" `
+                        -backend-config="key=$(tf_backend_key)"
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Plan'
+                  inputs:
+                    azureSubscription: 'DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD'
+                    scriptType: 'pscore'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(tf_working_dir)
+                      terraform plan -out=tfplan -input=false
+                    addSpnToEnvironment: true
+
+      - job: validation_step_prod
+        displayName: Terraform Plan Validation - PROD
+        dependsOn: terraform_plan_prod
+        pool: server
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 120
+            inputs:
+              instructions: 'Please review the Terraform Plan output for PROD Front Door deployment and approve to proceed with apply. This is PRODUCTION - verify carefully!'
+              onTimeout: 'reject'
+
+      - deployment: terraform_apply_prod
+        displayName: 'Terraform Apply: Front Door PROD'
+        dependsOn: validation_step_prod
+        environment: prod
+        variables:
+          tf_environment: prod
+          tf_working_dir: '$(Pipeline.Workspace)/frontdoor-terraform/deployments/prod'
+          tf_backend_resource_group: TROP-DEVOPS-TERRAFORM-PROD
+          tf_backend_storage_account: tfwtwhcbtroprodpex
+          tf_backend_container: frontdoor-prod
+          tf_backend_key: frontdoor-prod.tfstate
+          ARM_SUBSCRIPTION_ID: $(kv-arm-subscription-id-prod)
+          ARM_CLIENT_ID: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD-clientid)
+          ARM_CLIENT_SECRET: $(kv-DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD)
+          ARM_TENANT_ID: $(kv-arm-tenant-id)
+          TF_VAR_dns_zone_id: $(kv-dns-zone-id-prod)
+          TF_VAR_cdn_contributor_spn: $(kv-cdn-contributor-spn-prod)
+        pool:
+          name: $(AgentPool)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: frontdoor-terraform
+                  displayName: 'Download Terraform Artifacts'
+
+                - task: TerraformInstaller@0
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(TerraformVersion)
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Init'
+                  inputs:
+                    azureSubscription: 'DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD'
+                    scriptType: 'pscore'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(tf_working_dir)
+                      terraform init `
+                        -backend-config="resource_group_name=$(tf_backend_resource_group)" `
+                        -backend-config="storage_account_name=$(tf_backend_storage_account)" `
+                        -backend-config="container_name=$(tf_backend_container)" `
+                        -backend-config="key=$(tf_backend_key)"
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Apply'
+                  inputs:
+                    azureSubscription: 'DEVOPS-AZDO-Pipeline-Subscription-Contributor-PROD'
+                    scriptType: 'pscore'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(tf_working_dir)
+                      terraform apply -auto-approve -input=false
+                    addSpnToEnvironment: true
